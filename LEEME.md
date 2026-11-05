@@ -1,32 +1,11 @@
-# Trading Paso a Paso
+# Trading Paso a Paso (v2: Oro swing)
 
-App web instalable (PWA), sin dependencias ni paso de compilación. Son archivos estáticos.
+Novedad: pantalla **Practicar → Oro swing** con gráfico de velas (1D y 4H), EMA 20/50, señales de compra/venta,
+stop, objetivo y resultado. Datos en vivo (Yahoo Finance), simulados o tu propio CSV.
 
-## Publicarla en Vercel (para instalarla en el celular)
+## Cómo actualizar tu app en Vercel
+1. Copiá TODO el contenido de esta carpeta sobre tu carpeta local (reemplazá los archivos). Es importante la carpeta `api`.
+2. Subí los cambios a GitHub (si usás la web: "Add file" → "Upload files", arrastrá los archivos y la carpeta `api`; "Commit changes").
+3. Vercel publica solo en 1-2 minutos. Abrí la app en el celu y cerrala/abrila dos veces para que tome la versión nueva.
 
-**Opción A, desde GitHub**
-1. Creá un repositorio nuevo y subí todo el contenido de esta carpeta a la raíz.
-2. En Vercel: Add New > Project > elegí el repositorio > Deploy. No hace falta cambiar ninguna configuración.
-
-**Opción B, con la CLI**
-1. En esta carpeta: `npx vercel --prod`
-
-## Instalarla en el celular
-Abrí la URL de Vercel en el celular.
-- **Android (Chrome):** menú ⋮ > "Instalar app".
-- **iPhone (Safari):** Compartir > "Agregar a inicio".
-
-Después de la primera carga funciona sin conexión.
-
-## Actualizar
-Cuando cambies archivos, subí el número de versión en `sw.js` (`const VERSION = 'tpp-v2'`) para que los celulares descarguen la versión nueva.
-
-## Archivos
-- `engine.js`: cálculos (backtest, indicadores, riesgo, CSV).
-- `content.js`: lecciones, quizzes, glosario, estrategias.
-- `app.js`: pantallas y lógica de la interfaz.
-- `style.css`: diseño.
-- `sw.js`, `manifest.webmanifest`, íconos: lo que la hace instalable.
-
-Tu progreso, diario y plan se guardan en el propio dispositivo (localStorage).
-Material educativo. No es recomendación de inversión.
+La carpeta `api` es una función de Vercel que trae las velas del oro. Sin ella, la app funciona igual con datos simulados o CSV.

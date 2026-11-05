@@ -30,7 +30,7 @@
 
   /* ---------- estado persistente ---------- */
   var KEY = 'tpp_v1';
-  function defaults() { return { done: {}, quiz: {}, exam: {}, journal: [], plan: {}, check: {}, theme: 'auto' }; }
+  function defaults() { return { done: {}, quiz: {}, exam: {}, journal: [], plan: {}, check: {}, theme: 'auto', gold: { cfg: {}, mode: 'intraday' } }; }
   function load() {
     try {
       var s = JSON.parse(localStorage.getItem(KEY));
@@ -39,6 +39,7 @@
     return defaults();
   }
   var S = load();
+  if (!S.gold || typeof S.gold !== 'object') S.gold = { cfg: {}, mode: 'intraday' };
   function save() { try { localStorage.setItem(KEY, JSON.stringify(S)); } catch (e) { /* sin almacenamiento */ } }
 
   var themeSetByUs = false;
@@ -181,6 +182,7 @@
     calculadora: { t: 'Calculadora de riesgo', tab: 'practicar', up: 'practicar', v: vCalc, m: mCalc },
     plan: { t: 'Mi plan y checklist', tab: 'practicar', up: 'practicar', v: vPlan, m: mPlan },
     estrategias: { t: 'Estrategias', tab: 'practicar', up: 'practicar', v: vEstrategias },
+    oro: { t: 'Oro swing', tab: 'practicar', up: 'practicar', v: vOro, m: mOro },
     diario: { t: 'Diario', tab: 'diario', v: vDiario },
     mas: { t: 'Más', tab: 'mas', v: vMas },
     glosario: { t: 'Glosario', tab: 'mas', up: 'mas', v: vGlosario, m: mGlosario }
@@ -231,6 +233,7 @@
         '<p class="ok-note">Ya pasaste por todas las lecciones. Seguí practicando en demo.</p>') + '</section>' +
       '<h2>Tres niveles</h2><div class="levels">' + C.levels.map(levelCard).join('') + '</div>' +
       '<h2>Para practicar</h2><div class="tools">' +
+      '<a class="tool" href="#oro"><b>Oro swing</b><span>Gráfico con EMAs, señales, stop y objetivo.</span></a>' +
       '<a class="tool" href="#simulador"><b>Simulador</b><span>Operá velas simuladas con stop y objetivo.</span></a>' +
       '<a class="tool" href="#backtest"><b>Backtester</b><span>Probá reglas sobre datos simulados o tu CSV.</span></a>' +
       '<a class="tool" href="#calculadora"><b>Calculadora</b><span>Tamaño de posición según tu riesgo.</span></a>' +
@@ -322,7 +325,8 @@
   /* ---------- Practicar ---------- */
   function vPracticar() {
     return '<div class="stack">' +
-      [['simulador', 'Simulador de trading', 'Velas simuladas: abrí compras y ventas con stop y objetivo, y mirá cómo se resuelven.'],
+      [['oro', 'Oro swing con gráfico', 'Tu estrategia con EMA 20/50: velas 1D y 4H, cuándo comprar o vender, stop, objetivo y resultado.'],
+       ['simulador', 'Simulador de trading', 'Velas simuladas: abrí compras y ventas con stop y objetivo, y mirá cómo se resuelven.'],
        ['backtest', 'Backtester', 'Probá cuatro estrategias con datos simulados o con tu propio CSV. Incluye tramo out-of-sample.'],
        ['calculadora', 'Calculadora de riesgo', 'Cuántas unidades comprar según tu capital, tu riesgo y tu stop.'],
        ['estrategias', 'Estrategias de oro y Nasdaq', 'Cuatro esquemas simples, de day trading y de swing, para probar en demo.'],
@@ -563,6 +567,401 @@
   }
   function mBt() { btRun(); }
 
+
+  /* ---------- Oro swing: gráfico, señales y resultados ---------- */
+  var GCACHE = 'tpp_gold_v1';
+  var gold = {
+    src: /^https?:$/.test(location.protocol) ? 'live' : 'demo', symbol: 'GC=F', tf: '4h', mode: null,
+    raw: null, nowRef: null, prep: null, run: null, runMode: 'intraday', loading: false, err: '', info: '',
+    csvText: '', csvErr: '', csvInfo: '', view: null, cross: null, focus: null, optOpen: false, seed: 7, ema: null, drawQ: 0
+  };
+  function gcfg() { return Object.assign({}, E.GOLD_DEF, (S.gold && S.gold.cfg) || {}); }
+  function fdt(t, withTime) {
+    if (!isFinite(t)) return '–';
+    try { return new Date(t).toLocaleString('es-AR', withTime === false ? { day: '2-digit', month: '2-digit' } : { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false }); }
+    catch (e) { return new Date(t).toISOString().slice(5, 16); }
+  }
+  function fax(t, withTime) {
+    if (!isFinite(t)) return '';
+    var d = new Date(t), pad = function (x) { return (x < 10 ? '0' : '') + x; };
+    return pad(d.getDate()) + '/' + pad(d.getMonth() + 1) + (withTime ? ' ' + pad(d.getHours()) + 'h' : '');
+  }
+  function usd(n) { return (n < 0 ? '−' : (n > 0 ? '+' : '')) + '$' + nf(Math.abs(n), 0); }
+
+  function gCompute() {
+    var raw = gold.raw;
+    if (!raw || !raw.length) { gold.run = null; gold.prep = null; return; }
+    var mode = gold.mode || (S.gold && S.gold.mode) || 'intraday';
+    var p = E.goldPrepare(raw, gold.nowRef);
+    gold.prep = p;
+    var daily = p.mode === 'daily' || mode === 'daily';
+    var d1c = p.openD1 ? p.d1.slice(0, -1) : p.d1, cfg = gcfg();
+    cfg.maxBars = daily ? 15 : 40;
+    if (daily) { gold.run = E.goldRun(d1c, d1c, 'daily', cfg); gold.runMode = 'daily'; gold.tf = '1d'; }
+    else {
+      var h4c = p.openH4 ? p.h4.slice(0, -1) : p.h4;
+      gold.run = E.goldRun(h4c, d1c, 'intraday', cfg); gold.runMode = 'intraday';
+      if (gold.tf !== '1d' && gold.tf !== '4h') gold.tf = '4h';
+    }
+    gold.ema = null;
+  }
+  function gLoad() {
+    gold.err = ''; gold.cross = null; gold.view = null; gold.focus = null;
+    if (gold.src === 'demo') {
+      gold.raw = E.genIntraday({ days: 220, seed: gold.seed }); gold.nowRef = null;
+      gold.info = 'Datos simulados (ficticios), 220 días. Sirven para entender cómo se ve la estrategia.';
+      gCompute(); return;
+    }
+    if (gold.src === 'csv') {
+      gold.nowRef = null; gold.info = gold.csvInfo;
+      if (gold.raw && gold.rawFrom === 'csv') gCompute(); else { gold.raw = null; gold.run = null; }
+      return;
+    }
+    gFetch();
+  }
+  function gCache() { try { var c = JSON.parse(localStorage.getItem(GCACHE)); return c && c.candles && c.candles.length ? c : null; } catch (e) { return null; } }
+  function gFetch() {
+    gold.loading = true; gold.err = '';
+    var done = function () { gold.loading = false; gCompute(); if (cur.name === 'oro') render(); };
+    var req;
+    try { req = fetch('api/gold?symbol=' + encodeURIComponent(gold.symbol)); } catch (e) { req = Promise.reject(e); }
+    Promise.resolve(req).then(function (r) {
+      return r.json().catch(function () { throw new Error('La respuesta no es válida (' + r.status + ')'); }).then(function (j) {
+        if (!r.ok || !j.candles || !j.candles.length) throw new Error(j && j.error ? j.error : 'Error ' + r.status);
+        return j;
+      });
+    }).then(function (j) {
+      gold.raw = j.candles; gold.rawFrom = 'live'; gold.nowRef = Date.now();
+      gold.info = gold.symbol + ' · velas de 1 hora · actualizado ' + fdt(Date.now()) + ' · último dato ' + fdt(j.candles[j.candles.length - 1].t);
+      try { localStorage.setItem(GCACHE, JSON.stringify({ symbol: gold.symbol, ts: Date.now(), candles: j.candles })); } catch (e) { /* sin espacio */ }
+      done();
+    }).catch(function (e) {
+      var c = gCache();
+      if (c) {
+        gold.raw = c.candles; gold.rawFrom = 'live'; gold.nowRef = c.ts;
+        gold.err = 'No pude actualizar (' + (e && e.message ? e.message : 'sin conexión') + '). Muestro los últimos datos guardados, del ' + fdt(c.ts) + '.';
+        gold.info = c.symbol + ' · datos guardados';
+      } else {
+        gold.err = 'No pude traer datos en vivo (' + (e && e.message ? e.message : 'sin conexión') + '). Muestro datos simulados. Si la app está en Vercel, revisá que exista la carpeta api.';
+        gold.src = 'demo'; gold.raw = E.genIntraday({ days: 220, seed: gold.seed }); gold.nowRef = null;
+        gold.info = 'Datos simulados (ficticios).';
+      }
+      done();
+    });
+  }
+
+  function gCandles() {
+    var p = gold.prep; if (!p) return [];
+    if (gold.tf === '4h' && p.h4) return p.h4;
+    return p.d1;
+  }
+  function gEma(candles) {
+    var cfg = gcfg(), key = gold.tf + '|' + candles.length + '|' + cfg.fast + '|' + cfg.slow + '|' + candles[candles.length - 1].c;
+    if (gold.ema && gold.ema.key === key) return gold.ema;
+    var cl = candles.map(function (c) { return c.c; });
+    gold.ema = { key: key, f: E.ema(cl, cfg.fast), s: E.ema(cl, cfg.slow) };
+    return gold.ema;
+  }
+  function gDirect() { return (gold.runMode === 'daily' && gold.tf === '1d') || (gold.runMode === 'intraday' && gold.tf === '4h'); }
+  function gIdx(candles, tr, which) {
+    if (gDirect()) return tr[which];
+    var t = which === 'i0' ? tr.t0 : tr.t1;
+    if (!isFinite(t)) return tr[which];
+    var lo = 0, hi = candles.length - 1, ans = 0;
+    while (lo <= hi) { var m = (lo + hi) >> 1; if (candles[m].t <= t) { ans = m; lo = m + 1; } else hi = m - 1; }
+    return ans;
+  }
+  function gViewReset(focusIdx) {
+    var cs = gCandles(), n = cs.length; if (!n) return;
+    var count = Math.min(n, gold.tf === '4h' ? 60 : 50);
+    var start = focusIdx != null ? focusIdx - count * 0.4 : n - count + Math.round(count * 0.08);
+    gold.view = { start: start, count: count };
+    gClamp();
+  }
+  function gClamp() {
+    var n = gCandles().length, v = gold.view; if (!v) return;
+    v.start = Math.max(-v.count * 0.1, Math.min(n - v.count * 0.8, v.start));
+  }
+  function gSched() { if (gold.drawQ) return; gold.drawQ = requestAnimationFrame(function () { gold.drawQ = 0; drawGold(); }); }
+
+  function drawGold() {
+    var cv = $('#gcv'); if (!cv || !gold.run) return;
+    var candles = gCandles(), n = candles.length; if (!n) return;
+    if (!gold.view) gViewReset();
+    var g = setupCanvas(cv, 360); if (!g) return;
+    var ctx = g.ctx, w = g.w, h = g.h, v = gold.view;
+    var up = css('--up'), dn = css('--down'), ink = css('--ink'), mut = css('--muted'), ln = css('--line'), bg = css('--bg');
+    var C20 = '#2FB36D', C50 = '#F29A1F';
+    var padR = 62, padT = 8, padB = 22, pw = w - padR, ph = h - padT - padB, step = pw / v.count;
+    var i0 = Math.max(0, Math.floor(v.start)), i1 = Math.min(n - 1, Math.ceil(v.start + v.count));
+    var em = gEma(candles), run = gold.run, i, lo = Infinity, hi = -Infinity;
+    for (i = i0; i <= i1; i++) {
+      var c = candles[i]; if (c.l < lo) lo = c.l; if (c.h > hi) hi = c.h;
+      if (isFinite(em.f[i])) { lo = Math.min(lo, em.f[i]); hi = Math.max(hi, em.f[i]); }
+      if (isFinite(em.s[i])) { lo = Math.min(lo, em.s[i]); hi = Math.max(hi, em.s[i]); }
+    }
+    var trs = run.trades.slice(); if (run.open) trs.push(run.open);
+    var pend = run.status.pend;
+    function ext(t) { [t.stop, t.tp].forEach(function (y) { if (y < lo) lo = y; if (y > hi) hi = y; }); }
+    if (run.open) ext(run.open);
+    if (pend) ext(pend);
+    if (gold.focus != null && trs[gold.focus]) ext(trs[gold.focus]);
+    var padv = (hi - lo) * 0.07 || 1; lo -= padv; hi += padv;
+    function Y(val) { return padT + (hi - val) / (hi - lo) * ph; }
+    function X(k) { return (k - v.start + 0.5) * step; }
+    ctx.font = '11px "JetBrains Mono", ui-monospace, monospace'; ctx.textBaseline = 'middle';
+    ctx.save(); ctx.beginPath(); ctx.rect(0, 0, pw, h); ctx.clip();
+    for (i = 0; i <= 5; i++) {
+      var yy = padT + ph * i / 5; ctx.strokeStyle = ln; ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(0, yy); ctx.lineTo(pw, yy); ctx.stroke();
+    }
+    ctx.restore();
+    ctx.fillStyle = mut;
+    for (i = 0; i <= 5; i++) { var val = hi - (hi - lo) * i / 5; ctx.fillText(nf(val, 0), pw + 6, padT + ph * i / 5); }
+    ctx.textBaseline = 'alphabetic';
+    for (i = 0; i <= 2; i++) {
+      var ti = Math.round(i0 + (i1 - i0) * i / 2), tx = Math.min(Math.max(X(ti), 28), pw - 28), tc = candles[ti];
+      var lab = tc && isFinite(tc.t) ? fax(tc.t, gold.tf === '4h') : '#' + ti;
+      ctx.textAlign = 'center'; ctx.fillText(lab, tx, h - 6);
+      ctx.strokeStyle = ln; ctx.beginPath(); ctx.moveTo(X(ti), padT + ph); ctx.lineTo(X(ti), padT + ph + 4); ctx.stroke();
+    }
+    ctx.textAlign = 'left';
+    ctx.save(); ctx.beginPath(); ctx.rect(0, padT, pw, ph); ctx.clip();
+    /* operaciones: cajas de stop y objetivo */
+    function box(t, k, isPend) {
+      var a, b;
+      if (isPend) { a = gIdx(candles, { i0: run.status.n - 1, t0: run.status.t }, 'i0'); b = a + 4; }
+      else { a = gIdx(candles, t, 'i0'); b = t.open ? Math.max(gIdx(candles, t, 'i1'), a) + 3 : Math.max(gIdx(candles, t, 'i1'), a); }
+      var xa = X(a) - step / 2, xb = X(b) + step / 2; if (xb - xa < step) xb = xa + step;
+      if (xb < 0 || xa > pw) return;
+      var yE = Y(isPend ? t.ref : t.entry), yS = Y(t.stop), yT = Y(t.tp), isF = !isPend && gold.focus === k;
+      ctx.globalAlpha = isPend ? 0.1 : 0.15;
+      ctx.fillStyle = dn; ctx.fillRect(xa, Math.min(yE, yS), xb - xa, Math.abs(yS - yE));
+      ctx.fillStyle = up; ctx.fillRect(xa, Math.min(yE, yT), xb - xa, Math.abs(yT - yE));
+      ctx.globalAlpha = 1; ctx.lineWidth = isF ? 2 : 1; ctx.setLineDash(isPend ? [4, 3] : []);
+      ctx.strokeStyle = dn; ctx.beginPath(); ctx.moveTo(xa, yS); ctx.lineTo(xb, yS); ctx.stroke();
+      ctx.strokeStyle = up; ctx.beginPath(); ctx.moveTo(xa, yT); ctx.lineTo(xb, yT); ctx.stroke();
+      ctx.strokeStyle = mut; ctx.setLineDash([3, 3]); ctx.beginPath(); ctx.moveTo(xa, yE); ctx.lineTo(xb, yE); ctx.stroke(); ctx.setLineDash([]);
+      if (isF) { ctx.strokeStyle = ink; ctx.lineWidth = 1.5; ctx.strokeRect(xa, Math.min(yT, yS), xb - xa, Math.abs(yT - yS)); }
+      var buy = t.dir === 1;
+      if (!isPend) {
+        var cx = X(a), cc = candles[a] || candles[candles.length - 1], my = buy ? Y(cc.l) + 9 : Y(cc.h) - 9;
+        ctx.fillStyle = buy ? up : dn; ctx.beginPath();
+        if (buy) { ctx.moveTo(cx, my - 6); ctx.lineTo(cx - 5, my + 4); ctx.lineTo(cx + 5, my + 4); }
+        else { ctx.moveTo(cx, my + 6); ctx.lineTo(cx - 5, my - 4); ctx.lineTo(cx + 5, my - 4); }
+        ctx.closePath(); ctx.fill();
+      }
+      var txt = isPend ? (buy ? 'SEÑAL: COMPRA' : 'SEÑAL: VENTA') : (t.open ? 'abierta ' : '') + (t.R > 0 ? '+' : '−') + nf(Math.abs(t.R), 1) + 'R';
+      var tw = ctx.measureText(txt).width + 10, tx2 = Math.min(Math.max(xb - tw, isPend ? 0 : xa), pw - tw), ty = isPend ? Y(t.tp) + (buy ? -11 : 11) : Y(t.exit);
+      ty = Math.max(padT + 9, Math.min(padT + ph - 9, ty));
+      ctx.fillStyle = isPend ? ink : (t.R > 0 ? up : dn); ctx.fillRect(tx2, ty - 8, tw, 16);
+      ctx.fillStyle = isPend ? bg : '#fff'; ctx.textAlign = 'left'; ctx.textBaseline = 'middle'; ctx.fillText(txt, tx2 + 5, ty);
+    }
+    if (gold.showTrades !== false) {
+      trs.forEach(function (t, k) { box(t, k, false); });
+      if (pend) box(pend, -1, true);
+    }
+    /* velas */
+    var bw = Math.max(1, step * 0.7);
+    for (i = i0; i <= i1; i++) {
+      var cd = candles[i], x = X(i), col = cd.c >= cd.o ? up : dn;
+      ctx.strokeStyle = col; ctx.fillStyle = col; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(x, Y(cd.h)); ctx.lineTo(x, Y(cd.l)); ctx.stroke();
+      var ya = Y(Math.max(cd.o, cd.c)), yb = Y(Math.min(cd.o, cd.c));
+      ctx.fillRect(x - bw / 2, ya, bw, Math.max(1, yb - ya));
+    }
+    function line(arr, color) {
+      ctx.strokeStyle = color; ctx.lineWidth = 1.7; ctx.beginPath(); var st = false;
+      for (var k = Math.max(0, i0 - 1); k <= Math.min(n - 1, i1 + 1); k++) {
+        if (!isFinite(arr[k])) continue;
+        if (!st) { ctx.moveTo(X(k), Y(arr[k])); st = true; } else ctx.lineTo(X(k), Y(arr[k]));
+      }
+      ctx.stroke();
+    }
+    line(em.s, C50); line(em.f, C20);
+    if (gold.cross != null && gold.cross >= i0 && gold.cross <= i1) {
+      ctx.strokeStyle = mut; ctx.setLineDash([3, 3]); ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(X(gold.cross), padT); ctx.lineTo(X(gold.cross), padT + ph); ctx.stroke(); ctx.setLineDash([]);
+    }
+    ctx.restore();
+    /* etiquetas de precio a la derecha */
+    var last = candles[n - 1], tags = [
+      { y: Y(last.c), txt: nf(last.c, 2), bg: ink, fg: bg },
+      isFinite(em.f[n - 1]) ? { y: Y(em.f[n - 1]), txt: nf(em.f[n - 1], 2), bg: C20, fg: '#fff' } : null,
+      isFinite(em.s[n - 1]) ? { y: Y(em.s[n - 1]), txt: nf(em.s[n - 1], 2), bg: C50, fg: '#fff' } : null
+    ].filter(function (t) { return t && t.y > padT - 4 && t.y < padT + ph + 4; }).sort(function (a, b) { return a.y - b.y; });
+    for (i = 1; i < tags.length; i++) if (tags[i].y - tags[i - 1].y < 16) tags[i].y = tags[i - 1].y + 16;
+    ctx.textBaseline = 'middle';
+    tags.forEach(function (t) { ctx.fillStyle = t.bg; ctx.fillRect(pw + 1, t.y - 8, padR - 1, 16); ctx.fillStyle = t.fg; ctx.fillText(t.txt, pw + 4, t.y); });
+    /* leyenda */
+    var li = gold.cross != null ? gold.cross : n - 1, lc = candles[li], lg = $('#gleg');
+    if (lg && lc) {
+      var chg = lc.c - lc.o, nm = (gold.symbol === 'XAUUSD=X' ? 'XAUUSD' : 'Oro') + ' · ' + (gold.tf === '4h' ? '4H' : '1D');
+      lg.innerHTML = '<b>' + nm + '</b> ' + (isFinite(lc.t) ? fdt(lc.t, gold.tf === '4h') : '#' + li) +
+        ' <span>A ' + nf(lc.o, 2) + '</span> <span>M ' + nf(lc.h, 2) + '</span> <span>m ' + nf(lc.l, 2) + '</span> <span class="' + cls(chg) + '">C ' + nf(lc.c, 2) + '</span>' +
+        ' <span style="color:' + C20 + '">EMA' + gcfg().fast + ' ' + nf(em.f[li], 2) + '</span> <span style="color:' + C50 + '">EMA' + gcfg().slow + ' ' + nf(em.s[li], 2) + '</span>';
+    }
+  }
+  function drawGoldEq() {
+    var cv = $('#gecv'); if (!cv || !gold.run) return;
+    drawEquity(cv, [{ data: gold.run.curve, color: css('--accent'), w: 2 }], { h: 170 });
+  }
+
+  function gCheck(ok, label, detail) {
+    return '<li class="chk ' + (ok ? 'yes' : 'no') + '"><span class="ic" aria-hidden="true">' + (ok ? '✓' : '✗') + '</span><span><b>' + esc(label) + '</b>' + (detail ? '<small>' + esc(detail) + '</small>' : '') + '</span></li>';
+  }
+  function gSignalHtml() {
+    var run = gold.run; if (!run) return '';
+    var st = run.status, ev = st.ev, cfg = run.cfg, tf = gold.runMode === 'daily' ? 'diaria' : '4H';
+    if (!ev) return '';
+    var out = '<div class="card gsig">';
+    var bias = ev.bias, bn = bias === 1 ? 'alcista' : (bias === -1 ? 'bajista' : 'sin dirección clara');
+    if (run.open) {
+      var o = run.open, buy = o.dir === 1;
+      out += '<span class="eyebrow">Ahora</span><h3 style="margin-top:0">Hay una operación abierta: ' + (buy ? 'COMPRA' : 'VENTA') + '</h3>' +
+        '<div class="stats">' + gst('Entrada', nf(o.entry, 2)) + gst('Resultado hoy', sgn(o.R, 2) + ' R · ' + usd(o.pnl), cls(o.R)) + gst('Stop', nf(o.stop, 2), 'down') + gst('Objetivo', nf(o.tp, 2), 'up') + '</div>' +
+        '<p class="muted" style="font-size:.86rem;margin:10px 0 0">Según las reglas, esta operación sigue viva hasta tocar stop u objetivo. No muevas el stop en contra.</p>';
+    } else if (st.pend) {
+      var p = st.pend, bu = p.dir === 1;
+      out += '<span class="eyebrow">Ahora</span><div class="sigbadge ' + (bu ? 'buy' : 'sell') + '">' + (bu ? 'SEÑAL DE COMPRA' : 'SEÑAL DE VENTA') + '</div>' +
+        '<p class="muted" style="margin:8px 0 12px;font-size:.9rem">La vela ' + tf + ' acaba de cerrar con todas las condiciones. Se entra en la apertura de la vela siguiente.</p>' +
+        '<div class="stats">' + gst('Entrada (aprox.)', nf(p.ref, 2)) + gst('Stop', nf(p.stop, 2), 'down') + gst('Objetivo', nf(p.tp, 2), 'up') + gst('R:R', '1 : ' + nf(cfg.rr, 1)) +
+        gst('Arriesgás', usd(-p.riskAmt).replace('−', '−'), 'down') + gst('Ganás si llega', usd(p.rewardAmt), 'up') + '</div>' +
+        '<p class="mono" style="margin:12px 0 0;font-size:.88rem">Tamaño: <b>' + nf(p.oz, 2) + ' oz</b> (' + nf(p.lots, 3) + ' lotes de 100 oz)</p>';
+    } else {
+      out += '<span class="eyebrow">Ahora</span><div class="sigbadge wait">SIN SEÑAL · ESPERAR</div>' +
+        '<p class="muted" style="margin:8px 0 0;font-size:.9rem">' + (bias === 0 ? 'Sin dirección clara en el gráfico diario: la regla es no operar.' : 'Hay sesgo ' + bn + ', pero falta que se cumplan las condiciones de entrada.') + '</p>';
+    }
+    /* lista de condiciones */
+    var dn = bias === -1;
+    out += '<ul class="chks">' + gCheck(bias !== 0, 'Sesgo diario: ' + bn,
+      'Cierre ' + nf(st.dClose, 2) + ' · EMA ' + cfg.fast + ' ' + nf(st.fd, 2) + ' · EMA ' + cfg.slow + ' ' + nf(st.sd, 2));
+    if (bias !== 0) {
+      out += gCheck(!!ev.touched, 'El precio retrocedió a la zona de las EMAs ' + tf, 'Zona ' + nf(Math.min(ev.f, ev.s), 2) + ' – ' + nf(Math.max(ev.f, ev.s), 2)) +
+        gCheck(!!ev.confirm, 'Vela de rechazo ' + (dn ? 'roja que cierra debajo de las dos EMAs' : 'verde que cierra arriba de las dos EMAs'), '') +
+        gCheck(!!ev.stopOk, 'Stop razonable (hasta ' + cfg.maxStopAtr + ' ATR)', 'Stop a ' + nf(ev.dist, 1) + ' puntos = ' + nf(ev.stopAtr, 1) + ' ATR');
+    }
+    out += '</ul>';
+    if (bias !== 0) {
+      var zl = Math.min(ev.f, ev.s), zh = Math.max(ev.f, ev.s);
+      out += '<div class="lvls"><span class="eyebrow">Niveles para tus alertas</span>' +
+        '<div><span>' + (dn ? 'Zona de venta' : 'Zona de compra') + '</span><b class="mono">' + nf(zl, 2) + ' – ' + nf(zh, 2) + '</b></div>' +
+        '<div><span>Se anula el sesgo si el diario cierra ' + (dn ? 'sobre' : 'bajo') + '</span><b class="mono">' + nf(st.sd, 2) + '</b></div></div>';
+    }
+    return out + '</div>';
+  }
+  function gst(k, v, c) { return '<div class="stat"><div class="k">' + k + '</div><div class="v ' + (c || '') + '">' + v + '</div></div>'; }
+
+  function vOro() {
+    var p = gold.prep, run = gold.run, cfg = gcfg(), mode = gold.mode || (S.gold && S.gold.mode) || 'intraday';
+    function seg(key, items, curv) { return '<div class="seg" style="grid-template-columns:repeat(' + items.length + ',1fr)">' + items.map(function (i) { return '<button data-a="' + key + '" data-v="' + i[0] + '" aria-pressed="' + (curv === i[0]) + '">' + i[1] + '</button>'; }).join('') + '</div>'; }
+    function num(id, label, val, step) { return '<div class="fld"><label for="' + id + '">' + label + '</label><input id="' + id + '" type="number" inputmode="decimal" step="' + (step || 'any') + '" value="' + val + '"></div>'; }
+    var o = '<p class="muted">Tu estrategia de swing para el oro: el gráfico <b>diario</b> marca la dirección y el gráfico de <b>4 horas</b> marca la entrada. Todo se calcula con reglas fijas, sin opinión.</p>';
+    o += '<div class="card" style="margin-bottom:12px"><span class="eyebrow">Datos</span>' +
+      seg('gsrc', [['live', 'En vivo'], ['demo', 'Simulados'], ['csv', 'Mi CSV']], gold.src) +
+      '<p class="mono muted" style="font-size:.76rem;margin:10px 0 0">' + (gold.loading ? 'Cargando datos…' : esc(gold.info || '')) + '</p>' +
+      (gold.src === 'live' ? '<div class="grid2" style="margin-top:10px"><div class="fld"><label for="g_sym">Instrumento</label><select id="g_sym"><option value="GC=F"' + (gold.symbol === 'GC=F' ? ' selected' : '') + '>Futuros GC=F</option><option value="XAUUSD=X"' + (gold.symbol === 'XAUUSD=X' ? ' selected' : '') + '>Spot XAUUSD</option></select></div><button class="btn ghost sm" data-a="grefresh">Actualizar</button></div>' +
+        '<p class="muted" style="font-size:.78rem;margin:8px 0 0">Fuente: Yahoo Finance, con unos minutos de demora. Los futuros (GC=F) tienen un precio algo distinto al de OANDA que ves en TradingView: la forma del gráfico es igual, los niveles pueden diferir.</p>' : '') +
+      (gold.src === 'csv' ? '<div class="fld" style="margin-top:10px"><label for="g_file">Archivo CSV con fecha, open, high, low y close</label><input id="g_file" type="file" accept=".csv,.txt,text/csv,text/plain"></div>' +
+        '<div class="fld"><label for="g_csv">O pegá el contenido</label><textarea id="g_csv" rows="3">' + esc(gold.csvText) + '</textarea></div><button class="btn ghost sm" data-a="gcsv">Usar estos datos</button>' +
+        (gold.csvErr ? '<div class="callout bad">' + esc(gold.csvErr) + '</div>' : '') : '') +
+      '</div>';
+    if (gold.err) o += '<div class="callout warn">' + esc(gold.err) + '</div>';
+    if (gold.loading && !run) return o + '<div class="callout">Trayendo las velas de 1 hora…</div>';
+    if (!run) return o + '<div class="callout">Cargá datos para ver el gráfico.</div>';
+    if (p.note) o += '<div class="callout">' + esc(p.note) + '</div>';
+    if (p.mode === 'intraday') {
+      o += '<div class="fld" style="margin:0 0 12px"><label>Versión de la estrategia</label>' + seg('gmode', [['intraday', 'Diario + 4H'], ['daily', 'Solo diario']], mode) + '</div>';
+    }
+    o += gSignalHtml();
+    /* gráfico */
+    var canTf = p.h4 && gold.runMode === 'intraday';
+    o += '<h2>Gráfico</h2><div class="gtools">' + (canTf ? seg('gtf', [['1d', '1D'], ['4h', '4H']], gold.tf) : '<div></div>') +
+      '<div class="zoom"><button class="btn ghost sm" data-a="gzoom" data-f="1.3" aria-label="Alejar">−</button><button class="btn ghost sm" data-a="gzoom" data-f="0.77" aria-label="Acercar">+</button><button class="btn ghost sm" data-a="gend">Hoy</button></div></div>' +
+      '<div class="gleg mono" id="gleg"></div><canvas class="cv gcv" id="gcv" role="img" aria-label="Gráfico de velas del oro con EMAs y operaciones"></canvas>' +
+      '<p class="muted" style="font-size:.8rem;margin:6px 0 0"><span style="color:#2FB36D">━</span> EMA ' + cfg.fast + ' · <span style="color:#F29A1F">━</span> EMA ' + cfg.slow + ' · cajas: <span style="color:var(--down)">■</span> stop · <span style="color:var(--up)">■</span> objetivo. Arrastrá para moverte, tocá una vela para ver sus datos.</p>' +
+      '<label class="chkrow"><input type="checkbox" data-c="gtr"' + (gold.showTrades === false ? '' : ' checked') + '> Mostrar operaciones en el gráfico</label>';
+    /* resultados */
+    var m = run.m, all = run.trades.slice().reverse();
+    o += '<h2>Qué hubiera pasado con estas reglas</h2>';
+    if (!m.n) o += '<div class="callout warn">En estos datos no hubo ninguna operación cerrada.</div>';
+    else {
+      var net = run.capital - cfg.capital;
+      o += (m.n < 30 ? '<div class="callout warn">Solo ' + m.n + ' operaciones: con tan pocas, el resultado puede ser puro azar. Usá más historia o probá en demo.</div>' : '') +
+        (gold.src === 'demo' ? '<div class="callout">Datos ficticios: sirven para ver cómo funcionan las reglas, no para saber si ganan plata en el oro real.</div>' : '') +
+        '<div class="stats">' + gst('Operaciones', m.n) + gst('Aciertos', nf(m.winRate, 0) + '%') +
+        gst('Expectativa', sgn(m.exp, 2) + ' R', cls(m.exp)) + gst('Total', sgn(m.totalR, 1) + ' R', cls(m.totalR)) +
+        gst('Capital', '$' + nf(run.capital, 0), cls(net)) + gst('Resultado', usd(net) + ' (' + sgn(run.ret, 1) + '%)', cls(net)) +
+        gst('Profit factor', nf(m.pf, 2)) + gst('Caída máxima', '−' + nf(run.dd, 1) + '%', 'down') + '</div>' +
+        '<h3>Capital operación a operación</h3><canvas class="cv" id="gecv" role="img" aria-label="Curva de capital"></canvas>' +
+        '<p class="muted" style="font-size:.8rem;margin:6px 0 0">Capital inicial $' + nf(cfg.capital, 0) + ' · riesgo ' + nf(cfg.riskPct, 1) + '% por operación · costo ' + nf(cfg.costPts, 2) + ' USD por onza (spread).</p>';
+    }
+    var rows = [];
+    if (run.open) rows.push({ t: run.open, k: run.trades.length });
+    all.forEach(function (t, i) { rows.push({ t: t, k: run.trades.length - 1 - i }); });
+    if (rows.length) {
+      o += '<h3>Operaciones</h3><div class="scroll"><table><thead><tr><th>Fecha</th><th>Tipo</th><th class="num">Entrada</th><th class="num">Stop</th><th class="num">Objetivo</th><th class="num">R</th><th class="num">USD</th><th></th></tr></thead><tbody>' +
+        rows.slice(0, 20).map(function (r) {
+          var t = r.t;
+          return '<tr><td>' + fdt(t.t0, gold.runMode !== 'daily') + '</td><td>' + (t.dir === 1 ? 'Compra' : 'Venta') + (t.open ? ' · abierta' : '') + '</td><td class="num">' + nf(t.entry, 2) + '</td><td class="num">' + nf(t.stop, 2) + '</td><td class="num">' + nf(t.tp, 2) + '</td><td class="num ' + cls(t.R) + '">' + sgn(t.R, 2) + '</td><td class="num ' + cls(t.pnl) + '">' + usd(t.pnl) + '</td><td><button class="btn ghost sm" data-a="gfocus" data-k="' + r.k + '">Ver</button></td></tr>';
+        }).join('') + '</tbody></table></div>' + (rows.length > 20 ? '<p class="muted" style="font-size:.8rem">Se muestran las últimas 20.</p>' : '');
+    }
+    /* parámetros y reglas */
+    o += '<h2>Ajustes</h2><details class="card"' + (gold.optOpen ? ' open' : '') + ' data-d="opt"><summary>Cambiar parámetros</summary><form class="form" onsubmit="return false" style="margin-top:12px">' +
+      '<div class="grid2">' + num('g_fast', 'EMA rápida', cfg.fast, '1') + num('g_slow', 'EMA lenta', cfg.slow, '1') + '</div>' +
+      '<div class="grid2">' + num('g_rr', 'Objetivo (R:R)', cfg.rr, '0.1') + num('g_swing', 'Velas para el stop', cfg.swing, '1') + '</div>' +
+      '<div class="grid2">' + num('g_buf', 'Margen del stop (× ATR)', cfg.buf, '0.05') + num('g_max', 'Stop máximo (× ATR)', cfg.maxStopAtr, '0.5') + '</div>' +
+      '<div class="grid2">' + num('g_risk', 'Riesgo por operación (%)', cfg.riskPct, '0.1') + num('g_cap', 'Capital (USD)', cfg.capital, '100') + '</div>' +
+      num('g_cost', 'Costo por onza (USD, spread)', cfg.costPts, '0.1') +
+      '<button class="btn" data-a="gapply">Aplicar</button><button class="btn ghost" data-a="greset" style="margin-top:8px">Volver a los valores originales</button></form></details>' +
+      '<details class="card" style="margin-top:10px"><summary>Cómo funciona, paso a paso</summary><ol class="steps">' +
+      '<li><b>Sesgo (gráfico diario).</b> Si el cierre está debajo de la EMA ' + cfg.slow + ', la EMA ' + cfg.fast + ' está debajo de la ' + cfg.slow + ' y la ' + cfg.slow + ' baja, solo se busca vender. Al revés, solo comprar. Si no, no se opera.</li>' +
+      '<li><b>Retroceso (4H).</b> El precio rebota hasta la zona entre las dos EMAs de 4 horas.</li>' +
+      '<li><b>Rechazo.</b> Una vela de 4H cierra del lado de la tendencia, fuera de la zona (roja para vender, verde para comprar).</li>' +
+      '<li><b>Entrada.</b> En la apertura de la vela siguiente.</li>' +
+      '<li><b>Stop.</b> Más allá del último máximo (venta) o mínimo (compra) de las últimas ' + cfg.swing + ' velas, con un pequeño margen. Si queda demasiado lejos, se descarta la operación.</li>' +
+      '<li><b>Objetivo.</b> ' + nf(cfg.rr, 1) + ' veces lo que arriesgás.</li>' +
+      '<li><b>Salida.</b> Stop, objetivo o, si pasan ' + (gold.runMode === 'daily' ? 15 + ' días' : 40 + ' velas de 4H (unos 7 días)') + ', cierre por tiempo. Si una vela toca stop y objetivo a la vez, se cuenta el stop.</li></ol>' +
+      '<p class="muted" style="font-size:.85rem;margin:0">Antes de datos de EE.UU. (inflación, empleo, Fed) conviene no abrir operaciones: el oro se mueve de golpe. Esta pantalla no conoce el calendario.</p></details>' +
+      '<p class="disc">Material educativo. Una señal no es una recomendación ni una promesa de ganancia. Probá en demo antes de usar dinero real.</p>';
+    return o;
+  }
+  function mOro() {
+    if (!gold.raw && !gold.loading) gLoad();
+    drawFn = function () { drawGold(); drawGoldEq(); };
+    var cv = $('#gcv'); if (!cv) return;
+    var drag = null;
+    function setCross(e) {
+      var n = gCandles().length, r = cv.getBoundingClientRect(), step = (r.width - 62) / gold.view.count;
+      var idx = Math.round(gold.view.start + (e.clientX - r.left) / step - 0.5);
+      gold.cross = Math.max(0, Math.min(n - 1, idx)); gSched();
+    }
+    cv.addEventListener('pointerdown', function (e) { try { cv.setPointerCapture(e.pointerId); } catch (er) { /* sin soporte */ } drag = { x: e.clientX, s: gold.view.start, moved: false }; });
+    cv.addEventListener('pointermove', function (e) {
+      if (drag) {
+        var dx = e.clientX - drag.x; if (Math.abs(dx) > 3) drag.moved = true;
+        gold.view.start = drag.s - dx / ((cv.clientWidth - 62) / gold.view.count); gClamp(); gSched();
+      } else if (e.pointerType === 'mouse') setCross(e);
+    });
+    cv.addEventListener('pointerup', function (e) { if (drag && !drag.moved) setCross(e); drag = null; });
+    cv.addEventListener('pointercancel', function () { drag = null; });
+    cv.addEventListener('wheel', function (e) { e.preventDefault(); gZoom(e.deltaY > 0 ? 1.15 : 0.87); }, { passive: false });
+    drawFn();
+  }
+  function gZoom(f) {
+    var n = gCandles().length, v = gold.view; if (!v) return;
+    var end = v.start + v.count, c = Math.max(20, Math.min(Math.min(n, 400), Math.round(v.count * f)));
+    v.count = c; v.start = end - c; gClamp(); gSched();
+  }
+  function alert_(msg) { var el = $('#view'); var d = document.createElement('div'); d.className = 'callout warn'; d.setAttribute('role', 'alert'); d.textContent = msg; var f = $('details[data-d="opt"] form'); if (f) { var old = $('.callout', f); if (old) old.remove(); f.insertBefore(d, f.firstChild); } }
+  function gReadCfg() {
+    function val(id, d) { var el = $('#' + id); var x = el ? parseFloat(el.value) : NaN; return isFinite(x) ? x : d; }
+    var c = gcfg(), n = {
+      fast: Math.round(val('g_fast', c.fast)), slow: Math.round(val('g_slow', c.slow)), rr: val('g_rr', c.rr), swing: Math.round(val('g_swing', c.swing)),
+      buf: val('g_buf', c.buf), maxStopAtr: val('g_max', c.maxStopAtr), riskPct: val('g_risk', c.riskPct), capital: val('g_cap', c.capital), costPts: val('g_cost', c.costPts)
+    };
+    if (n.fast < 2 || n.slow <= n.fast || n.slow > 200 || n.rr <= 0 || n.swing < 2 || n.buf < 0 || n.maxStopAtr <= 0 || n.riskPct <= 0 || n.riskPct > 10 || n.capital <= 0 || n.costPts < 0) return null;
+    return n;
+  }
+
   /* ---------- Diario ---------- */
   function journalStats() {
     var tr = S.journal.map(function (j) { return { R: j.R }; });
@@ -654,6 +1053,32 @@
     snext: function (t) { simNext(+t.dataset.k); render(); },
     sclose: function () { if (sim.pos) { simClose(sim.candles[sim.idx].c, 'cierre manual'); render(); } },
     snew: function () { simNew(); render(); },
+    gsrc: function (t) { gold.src = t.dataset.v; gold.raw = gold.src === 'csv' ? gold.raw : null; gLoad(); render(); },
+    gmode: function (t) { gold.mode = t.dataset.v; S.gold.mode = gold.mode; save(); gold.view = null; gold.focus = null; gCompute(); render(); },
+    gtf: function (t) { gold.tf = t.dataset.v; gold.view = null; gold.cross = null; gold.focus = null; gold.ema = null; render(); },
+    gzoom: function (t) { gZoom(parseFloat(t.dataset.f)); },
+    gend: function () { gold.cross = null; gold.focus = null; gViewReset(); gSched(); },
+    grefresh: function () { gold.raw = null; gFetch(); render(); },
+    gfocus: function (t) {
+      var run = gold.run; if (!run) return;
+      var trs = run.trades.slice(); if (run.open) trs.push(run.open);
+      var k = +t.dataset.k, tr = trs[k]; if (!tr) return;
+      gold.focus = k; gViewReset(gIdx(gCandles(), tr, 'i0')); gold.cross = null;
+      gSched(); var cv = $('#gcv'); if (cv && cv.scrollIntoView) cv.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    },
+    gapply: function () {
+      var n = gReadCfg();
+      if (!n) { alert_('Revisá los valores: la EMA lenta debe ser mayor que la rápida y el riesgo estar entre 0 y 10%.'); return; }
+      S.gold.cfg = n; save(); gold.optOpen = true; gold.view = null; gold.focus = null; gCompute(); render();
+    },
+    greset: function () { S.gold.cfg = {}; save(); gold.optOpen = true; gold.view = null; gCompute(); render(); },
+    gcsv: function () {
+      var ta = $('#g_csv'); if (ta) gold.csvText = ta.value;
+      gold.csvErr = ''; gold.csvInfo = '';
+      try { gold.raw = E.parseCSV(gold.csvText); gold.rawFrom = 'csv'; gold.csvInfo = 'Archivo propio: ' + gold.raw.length + ' velas.'; gold.info = gold.csvInfo; gold.nowRef = null; gold.view = null; gCompute(); }
+      catch (e) { gold.csvErr = e.message; gold.raw = null; gold.run = null; }
+      render();
+    },
     btrun: function () { readBt(); btRun(); },
     btcsv: function () {
       readBt(); bt.err = ''; bt.csvInfo = '';
@@ -691,7 +1116,7 @@
       Promise.resolve(deferredPrompt.userChoice).catch(function () { }).then(function () { deferredPrompt = null; render(); });
     },
     reset: function () {
-      if (armed === 'reset') { S = defaults(); save(); applyTheme(); armed = null; sess = {}; } else armed = 'reset';
+      if (armed === 'reset') { S = defaults(); gold.mode = null; save(); applyTheme(); armed = null; sess = {}; } else armed = 'reset';
       render();
     }
   };
@@ -708,6 +1133,14 @@
       render();
     } else if (t.dataset && t.dataset.c === 'simema') { sim.ema = t.checked; render(); }
     else if (t.dataset && t.dataset.chk != null) { S.check[t.dataset.chk] = t.checked; save(); chkUpdate(); }
+    else if (t.id === 'g_sym') { gold.symbol = t.value; gold.raw = null; gFetch(); render(); }
+    else if (t.dataset && t.dataset.c === 'gtr') { gold.showTrades = t.checked; gSched(); }
+    else if (t.id === 'g_file' && t.files && t.files[0]) {
+      var fg = new FileReader();
+      fg.onload = function () { gold.csvText = String(fg.result || ''); actions.gcsv(); };
+      fg.onerror = function () { gold.csvErr = 'No pude leer el archivo.'; render(); };
+      fg.readAsText(t.files[0]);
+    }
     else if (t.id === 'b_strat') { readBt(); var s = BT_STRATS[bt.strategy]; bt.p1 = s.d1; bt.p2 = s.d2; render(); }
     else if (t.id === 'b_src') { readBt(); bt.err = ''; render(); }
     else if (t.id === 'b_file' && t.files && t.files[0]) {
@@ -721,6 +1154,7 @@
     var t = e.target;
     if (t.dataset && t.dataset.plan) { S.plan[t.dataset.plan] = t.value; save(); }
   });
+  document.addEventListener('toggle', function (e) { if (e.target && e.target.dataset && e.target.dataset.d === 'opt') gold.optOpen = e.target.open; }, true);
   window.addEventListener('hashchange', route);
   window.addEventListener('beforeinstallprompt', function (e) { e.preventDefault(); deferredPrompt = e; if (cur.name === 'mas') render(); });
   function redraw() { if (drawFn) drawFn(); }

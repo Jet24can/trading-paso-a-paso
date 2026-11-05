@@ -278,11 +278,169 @@
     return rows;
   }
 
+
+  /* ================= Oro swing: sesgo diario + entrada en 4H ================= */
+  var H1 = 3600000, DAY = 24 * H1;
+  var nyFmt = null;
+  try {
+    nyFmt = new Intl.DateTimeFormat('en-US', { timeZone: 'America/New_York', hourCycle: 'h23', year: 'numeric', month: 'numeric', day: 'numeric', hour: 'numeric', minute: 'numeric' });
+  } catch (e) { nyFmt = null; }
+  /* Hora de Nueva York + 7 h: el día del oro (y de TradingView/OANDA) cierra a las 17:00 de Nueva York. */
+  function nyShift(t) {
+    if (!nyFmt) return t + 2 * H1;
+    var p = {};
+    nyFmt.formatToParts(new Date(t)).forEach(function (x) { p[x.type] = x.value; });
+    return Date.UTC(+p.year, +p.month - 1, +p.day, (+p.hour) % 24, +p.minute) + 7 * H1;
+  }
+  function aggregate(c, P) {
+    var out = [], cur = null;
+    for (var i = 0; i < c.length; i++) {
+      var x = c[i], k = Math.floor(nyShift(x.t) / P);
+      if (cur && cur.k === k) { if (x.h > cur.h) cur.h = x.h; if (x.l < cur.l) cur.l = x.l; cur.c = x.c; }
+      else { cur = { t: x.t, k: k, o: x.o, h: x.h, l: x.l, c: x.c }; out.push(cur); }
+    }
+    return out;
+  }
+  /* Serie horaria ficticia, con fines de semana y regímenes de tendencia/lateral. */
+  function genIntraday(o) {
+    var days = o.days || 220, r = mulberry32(o.seed || 7), p = o.start || 3800, out = [], left = 0, reg = null;
+    var d0 = Date.UTC(2025, 5, 1, 21, 0); /* domingo 21:00 UTC ~ 17:00 NY */
+    for (var d = 0; d < days * 7 / 5 + 7 && out.length < days * 23; d++) {
+      var dt = d0 + d * DAY, wd = new Date(dt).getUTCDay(); /* 0 dom ... 6 sáb */
+      if (wd === 5 || wd === 6) continue;
+      if (left <= 0) {
+        left = 5 + Math.floor(r() * 18);
+        reg = { trend: r() < 0.55, drift: (r() < 0.5 ? -1 : 1) * (0.00005 + r() * 0.00012), vol: 0.0011 + r() * 0.0009, center: p };
+      }
+      left--;
+      for (var h = 0; h < 23; h++) {
+        var open = p, ret = reg.trend ? reg.drift + reg.vol * gauss(r) : -0.012 * Math.log(p / reg.center) + reg.vol * 0.9 * gauss(r);
+        var close = open * Math.exp(ret);
+        var hi = Math.max(open, close) + Math.abs(gauss(r)) * reg.vol * 0.4 * open;
+        var lo = Math.min(open, close) - Math.abs(gauss(r)) * reg.vol * 0.4 * open;
+        out.push({ t: dt + h * H1, o: open, h: hi, l: lo, c: close });
+        p = close;
+      }
+    }
+    return out;
+  }
+  /* Prepara velas 1h/4h/1d en dos escalas: 4H (entradas) y 1D (sesgo). now = hora actual si son datos en vivo. */
+  function goldPrepare(candles, now) {
+    var dated = candles.filter(function (x) { return isFinite(x.t); }).sort(function (a, b) { return a.t - b.t; });
+    var res = { mode: 'daily', h4: null, d1: null, openH4: false, openD1: false, note: '' };
+    if (dated.length < candles.length * 0.9 || dated.length < 30) {
+      res.d1 = candles.map(function (x, i) { return { t: NaN, k: i, o: x.o, h: x.h, l: x.l, c: x.c }; });
+      res.note = 'El archivo no trae fechas: solo se puede usar el gráfico diario.';
+      return res;
+    }
+    var diffs = [];
+    for (var i = 1; i < dated.length && i < 400; i++) diffs.push(dated[i].t - dated[i - 1].t);
+    diffs.sort(function (a, b) { return a - b; });
+    var dt = diffs[Math.floor(diffs.length / 2)] || DAY;
+    if (dt <= 4.5 * H1) {
+      res.mode = 'intraday'; res.h4 = aggregate(dated, 4 * H1); res.d1 = aggregate(dated, DAY);
+    } else if (dt <= 20 * H1) {
+      res.d1 = aggregate(dated, DAY); res.note = 'Las velas son de más de 4 horas: solo se puede usar el gráfico diario.';
+    } else {
+      res.d1 = dated.map(function (x) { return { t: x.t, k: Math.floor(nyShift(x.t) / DAY), o: x.o, h: x.h, l: x.l, c: x.c }; });
+      res.note = 'El archivo es diario: se usa la versión “solo diario” de la estrategia.';
+    }
+    if (now != null && res.mode === 'intraday') {
+      var ns = nyShift(now), l4 = res.h4[res.h4.length - 1], ld = res.d1[res.d1.length - 1];
+      res.openH4 = (l4.k + 1) * 4 * H1 > ns; res.openD1 = (ld.k + 1) * DAY > ns;
+    }
+    return res;
+  }
+
+  var GOLD_DEF = { fast: 20, slow: 50, rr: 2, buf: 0.25, swing: 6, maxStopAtr: 4, slope: 5, maxBars: 40, costPts: 0.5, riskPct: 1, capital: 10000, warmup: 60 };
+
+  /* entry: velas de entrada (4H, o 1D en modo diario). d1c: velas diarias cerradas. mode: 'intraday' | 'daily'. */
+  function goldRun(entry, d1c, mode, cfgIn) {
+    var cfg = Object.assign({}, GOLD_DEF, cfgIn || {});
+    var n = entry.length, close = entry.map(function (x) { return x.c; });
+    var f = ema(close, cfg.fast), s = ema(close, cfg.slow), a = atr(entry, 14);
+    var dc = d1c.map(function (x) { return x.c; }), fd = ema(dc, cfg.fast), sd = ema(dc, cfg.slow);
+    var jOf = new Array(n), i, j = -1;
+    for (i = 0; i < n; i++) {
+      if (mode === 'daily') jOf[i] = i;
+      else { var dk = Math.floor(entry[i].k / 6); while (j + 1 < d1c.length && d1c[j + 1].k < dk) j++; jOf[i] = j; }
+    }
+    function biasAt(jj) {
+      if (jj < cfg.slope || !isFinite(sd[jj]) || !isFinite(sd[jj - cfg.slope]) || !isFinite(fd[jj])) return 0;
+      var cl = dc[jj];
+      if (cl > sd[jj] && fd[jj] > sd[jj] && sd[jj] > sd[jj - cfg.slope]) return 1;
+      if (cl < sd[jj] && fd[jj] < sd[jj] && sd[jj] < sd[jj - cfg.slope]) return -1;
+      return 0;
+    }
+    /* Evalúa la vela i al cerrar. */
+    function evalBar(k) {
+      var x = entry[k], jj = jOf[k], r = { i: k, bias: jj >= 0 ? biasAt(jj) : 0, f: f[k], s: s[k], a: a[k], dir: 0, signal: false };
+      if (!isFinite(f[k]) || !isFinite(s[k]) || !isFinite(a[k]) || r.bias === 0) return r;
+      var d = r.bias, zl = Math.min(f[k], s[k]), zh = Math.max(f[k], s[k]);
+      r.touched = d === -1 ? x.h >= zl : x.l <= zh;
+      r.confirm = d === -1 ? (x.c < zl && x.c < x.o) : (x.c > zh && x.c > x.o);
+      var ext = d === -1 ? -Infinity : Infinity;
+      for (var m = Math.max(0, k - cfg.swing + 1); m <= k; m++) ext = d === -1 ? Math.max(ext, entry[m].h) : Math.min(ext, entry[m].l);
+      r.stop = d === -1 ? ext + cfg.buf * a[k] : ext - cfg.buf * a[k];
+      var dist = Math.abs(r.stop - x.c);
+      r.stopOk = dist > 0 && dist <= cfg.maxStopAtr * a[k] && (d === -1 ? r.stop > x.c : r.stop < x.c);
+      r.dist = dist; r.stopAtr = dist / a[k];
+      r.signal = r.touched && r.confirm && r.stopOk;
+      r.dir = r.signal ? d : 0;
+      return r;
+    }
+    var pos = null, trades = [], eq = 1, curve = new Array(n).fill(1), cap = cfg.capital, risk = cfg.riskPct / 100;
+    for (i = 0; i < n; i++) {
+      if (pos && i >= pos.i0) {
+        var b = entry[i], ex = checkExit(pos, b);
+        if (!ex && i - pos.i0 + 1 >= cfg.maxBars) ex = { price: b.c, reason: 'tiempo' };
+        if (ex) {
+          var R = pos.dir * (ex.price - pos.entry) / pos.dist - cfg.costPts / pos.dist;
+          var pnl = cap * eq * risk * R;
+          eq *= Math.max(0, 1 + risk * R);
+          trades.push({ i0: pos.i0, i1: i, t0: entry[pos.i0].t, t1: b.t, dir: pos.dir, entry: pos.entry, stop: pos.stop, tp: pos.tp, exit: ex.price, R: R, pnl: pnl, reason: ex.reason, sigI: pos.sigI });
+          pos = null;
+        }
+      }
+      curve[i] = eq;
+      if (!pos && i < n - 1 && i >= cfg.warmup) {
+        var ev = evalBar(i);
+        if (ev.signal) {
+          var en = entry[i + 1].o, dd = Math.abs(en - ev.stop);
+          var okSide = ev.dir === -1 ? ev.stop > en : ev.stop < en;
+          if (okSide && dd > 0 && dd <= cfg.maxStopAtr * a[i]) {
+            pos = { dir: ev.dir, i0: i + 1, entry: en, stop: ev.stop, dist: dd, tp: en + ev.dir * dd * cfg.rr, sigI: i };
+          }
+        }
+      }
+    }
+    var open = null;
+    if (pos && pos.i0 <= n - 1) {
+      var lc = entry[n - 1].c, fR = pos.dir * (lc - pos.entry) / pos.dist;
+      open = { i0: pos.i0, i1: n - 1, t0: entry[pos.i0].t, t1: entry[n - 1].t, dir: pos.dir, entry: pos.entry, stop: pos.stop, tp: pos.tp, exit: lc, R: fR, pnl: cap * eq * risk * fR, reason: 'abierta', open: true, sigI: pos.sigI };
+    }
+    var last = n - 1, st = n > 0 ? evalBar(last) : null, lastD = d1c.length - 1;
+    var pend = null; /* señal en la última vela cerrada: se entra en la apertura de la siguiente */
+    if (st && st.signal && !pos) {
+      var rd = st.dist, ref = entry[last].c;
+      pend = { dir: st.dir, ref: ref, stop: st.stop, tp: ref + st.dir * rd * cfg.rr, dist: rd,
+        riskAmt: cap * eq * risk, oz: cap * eq * risk / rd, lots: cap * eq * risk / rd / 100, rewardAmt: cap * eq * risk * cfg.rr };
+    }
+    return {
+      cfg: cfg, mode: mode, trades: trades, open: open, curve: curve, eq: eq, capital: cap * eq,
+      m: metrics(trades), dd: maxDrawdown(curve), ret: (eq - 1) * 100,
+      status: { ev: st, pend: pend, hasOpen: !!pos, t: n > 0 ? entry[last].t : NaN,
+        fd: lastD >= 0 ? fd[lastD] : NaN, sd: lastD >= 0 ? sd[lastD] : NaN, dClose: lastD >= 0 ? dc[lastD] : NaN,
+        f: f[last], s: s[last], a: a[last], close: close[last], n: n }
+    };
+  }
+
   var api = {
     mulberry32: mulberry32, genSeries: genSeries, sma: sma, ema: ema, rsi: rsi, atr: atr,
     checkExit: checkExit, buildSignals: buildSignals, metrics: metrics, maxDrawdown: maxDrawdown,
     backtest: backtest, calcRisk: calcRisk, capitalAfterLosses: capitalAfterLosses,
-    journalR: journalR, parseCSV: parseCSV
+    journalR: journalR, parseCSV: parseCSV,
+    nyShift: nyShift, aggregate: aggregate, genIntraday: genIntraday, goldPrepare: goldPrepare, goldRun: goldRun, GOLD_DEF: GOLD_DEF
   };
   root.TPE = api;
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
